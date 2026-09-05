@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ePDF Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/landing.css?v=32">
+  <link rel="stylesheet" href="/static/css/covers.css?v=32">
+</head>
+<body class="app">
+  <aside class="sidebar">
+    <a class="brand" href="/">
+      <span class="mark">&gt;</span>
+      ePDF Studio
+    </a>
+    <nav class="side-nav">
+      <a class="on" data-nav="home" href="/">Home</a>
+      <a data-nav="projects" href="/#projects">Projects</a>
+      <a href="/?create=1">New book</a>
+    </nav>
+    <div class="side-foot">
+      <p class="tiny">Local studio</p>
+      <p class="tiny muted">Files stay on this computer</p>
+    </div>
+  </aside>
+
+  <div class="stage">
+    <header class="stage-bar">
+      <div class="search-wrap">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3-3"/></svg>
+        <input id="search" type="search" placeholder="Search projects and templates" autocomplete="off">
+      </div>
+    </header>
+
+    <div id="stepper" class="stepper hidden">
+      <button type="button" class="step" data-step="1"><i>1</i><span>Generate</span></button>
+      <button type="button" class="step" data-step="2"><i>2</i><span>Write</span></button>
+      <button type="button" class="step" data-step="3"><i>3</i><span>Choose template</span></button>
+      <button type="button" class="step" data-step="4"><i>4</i><span>Review</span></button>
+      <button type="button" class="step" data-step="5"><i>5</i><span>Publish</span></button>
+    </div>
+
+    <!-- HOME -->
+    <section id="screen-home" class="screen">
+      <section class="recent recent-first" id="projects">
+        <div class="recent-head">
+          <h2>Recent books</h2>
+          <p>Pick up where you left off — up to 4 projects on this device</p>
+        </div>
+        <div class="recent-grid" id="recentGrid"></div>
+      </section>
+
+      <div class="create-block">
+        <h2 class="section-label">More ways to create</h2>
+        <div class="create-row">
+          <label class="create-card create-import" id="srcDrop">
+            <input type="file" id="source" name="source" accept=".docx,.doc,.docm,.rtf,.pdf">
+            <span class="create-icon">W</span>
+            <strong>Import Word or PDF</strong>
+            <span>Drag and drop, or browse your files</span>
+          </label>
+          <button type="button" class="create-card" id="tryWord">
+            <span class="create-icon sample">S</span>
+            <strong>Try sample Word</strong>
+            <span>Use our demo manuscript to explore</span>
+          </button>
+          <button type="button" class="create-card" id="startBlank">
+            <span class="create-icon blank">+</span>
+            <strong>Start from scratch</strong>
+            <span>Blank page — choose a template later</span>
+          </button>
+        </div>
+        <p class="create-foot">Or <button type="button" class="linkish" id="newBook">open the project creator</button> · <button type="button" class="linkish" id="tryPdf">sample PDF</button></p>
+      </div>
+
+      <div class="prompt-box">
+        <p class="prompt-kicker">Describe your book idea</p>
+        <textarea id="idea" placeholder="What would you like to write about?"></textarea>
+        <div class="prompt-actions">
+          <button type="button" class="primary" id="startIdea">Start writing</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- CREATE / GENERATE -->
+    <section id="screen-create" class="screen hidden">
+      <h1 class="page-title">Project creator</h1>
+      <div class="madlibs">
+        <p>I’d like to create an
+          <button type="button" class="linkish" id="kindBtn">eBook</button>
+        </p>
+        <p>to be published as
+          <button type="button" class="linkish" id="formatBtn">PDF — I’ll decide the look later</button>
+        </p>
+        <p>I’d like to
+          <button type="button" class="linkish" id="methodBtn">Import from Word or PDF</button>
+          as my baseline
+        </p>
+      </div>
+      <div class="create-file" id="createFileBox">
+        <label class="file-chip" id="fileChip">
+          <input type="file" id="sourceCreate" accept=".docx,.doc,.docm,.rtf,.pdf">
+          <span id="srcName">Choose a Word (.docx) or PDF</span>
+        </label>
+      </div>
+      <button type="button" class="primary lg" id="letsStart">Let’s start →</button>
+      <p class="status" id="status"></p>
+    </section>
+
+    <!-- TEMPLATES (hidden until this step) -->
+    <section id="screen-templates" class="screen hidden">
+      <div class="tpl-top">
+        <a class="back" href="#" id="tplBack">← Back</a>
+        <h1 class="page-title">Choose a template</h1>
+      </div>
+      <div class="tpl-tools">
+        <input id="tplSearch" type="search" placeholder="Search for a template">
+        <div class="filters" id="filters"></div>
+      </div>
+      <div class="gallery-wrap">
+        <div class="gallery-section">
+          <h2 class="gallery-label">All templates</h2>
+          <div class="gallery" id="gallery"></div>
+        </div>
+      </div>
+      <p class="chosen hidden" id="chosen" aria-hidden="true">Selected: Cream Handbook</p>
+      <input type="hidden" id="templateId" value="cream-handbook">
+      <details class="more">
+        <summary>Advanced — paste your own HTML + CSS</summary>
+        <label class="drop slim" id="tplDrop">
+          <input type="file" id="templates" accept=".html,.htm,.css,.zip" multiple>
+          <strong id="tplName">HTML, CSS, or ZIP</strong>
+        </label>
+        <textarea id="htmlText" placeholder="<!-- template.html -->"></textarea>
+        <textarea id="cssText" placeholder="/* template.css */"></textarea>
+      </details>
+      <div class="actions sticky-actions">
+        <button type="button" class="primary" id="useTpl">Use this template</button>
+      </div>
+    </section>
+  </div>
+
+  <dialog id="importModal" class="sheet">
+    <header>
+      <strong>Import from Word or PDF</strong>
+      <button type="button" class="x" id="importClose">×</button>
+    </header>
+    <p class="muted">The file becomes your manuscript. Templates come after you write.</p>
+    <div class="file-row" id="modalFileName">No file chosen yet</div>
+    <footer>
+      <button type="button" class="primary" id="importNext">Next</button>
+    </footer>
+  </dialog>
+
+  <dialog id="formatModal" class="sheet">
+    <header>
+      <strong>Choose your book format</strong>
+      <button type="button" class="x" data-close-format>×</button>
+    </header>
+    <p class="muted">Select the first format. You can still change the template in the next step.</p>
+    <div class="format-grid">
+      <button type="button" class="fmt on" data-fmt="ebook"><b>eBook</b><span>Designed PDF</span></button>
+      <button type="button" class="fmt" data-fmt="print"><b>Print book</b><span>Same PDF, print-ready</span></button>
+      <button type="button" class="fmt locked" disabled><b>Kindle</b><span>Coming later</span></button>
+      <button type="button" class="fmt locked" disabled><b>Audiobook</b><span>Coming later</span></button>
+    </div>
+    <p class="caption">You can create other looks later, too.</p>
+    <footer>
+      <button type="button" class="primary" id="formatNext">Continue</button>
+    </footer>
+  </dialog>
+
+  <dialog id="previewModal">
+    <div class="pick">
+      <div class="pick-left">
+        <div class="pick-preview">
+          <iframe id="previewFrame" title="Template preview"></iframe>
+        </div>
+        <div class="pick-thumbs" id="previewThumbs"></div>
+      </div>
+      <aside class="pick-side">
+        <button type="button" class="x" id="previewClose">×</button>
+        <h2 id="previewTitle">Template</h2>
+        <p class="desc" id="previewHint">You’ll be able to play with the template and change covers inside the editor.</p>
+        <div class="pick-tags" id="previewTags"></div>
+        <button type="button" class="primary" id="previewUse">Use this template</button>
+        <div class="side-btns">
+          <button type="button" class="ghost" id="previewWeb">Preview in web</button>
+          <button type="button" class="ghost" id="previewPdf">Preview in PDF</button>
+        </div>
+      </aside>
+    </div>
+  </dialog>
+
+  <form id="form" hidden></form>
+  <script src="/static/js/templates-data.js?v=26"></script>
+  <script src="/static/js/template-gallery.js?v=26"></script>
+  <script src="/static/js/landing.js?v=33"></script>
+</body>
+</html>

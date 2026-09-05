@@ -1,0 +1,10 @@
+# Render.com blueprint — connect your GitHub repo, then Deploy
+services:
+  - type: web
+    name: epdf-studio
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: EPDF_CHROME
+        value: /usr/bin/chromium
