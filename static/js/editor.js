@@ -27,6 +27,8 @@ let selected = null;
 let undoStack = [];
 let histIndex = -1;
 let pendingRestoreView = null;
+/** True while iframe is reloading from undo/redo — block new history entries. */
+let undoRestoring = false;
 let saveTimer = null;
 let editorMode = "write";
 let templateApplied = false;
@@ -60,15 +62,57 @@ body.epdf-resizing-table-col,
 body.epdf-resizing-table-col * { cursor: col-resize !important; }
 body.epdf-resizing-table-row,
 body.epdf-resizing-table-row * { cursor: row-resize !important; }
-.epdf-dragging { opacity: 0.5; }
+.epdf-dragging { opacity: 0.45; }
 .epdf-drop-line {
-  outline: 2px dashed #3b82f6 !important;
-  outline-offset: 4px;
+  /* legacy class — insertion uses #epdf-iframe-drop line instead */
+  outline: none !important;
 }
 .epdf-drop-page {
   outline: 2px dashed #60a5fa !important;
   outline-offset: -4px;
 }
+#epdf-iframe-drop {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 3px;
+  width: 40px;
+  background: #2563eb;
+  border-radius: 2px;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.22);
+  pointer-events: none;
+  z-index: 2147482990;
+  display: none;
+}
+#epdf-iframe-drop.visible { display: block; }
+#epdf-align-guides {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2147482980;
+  display: none;
+}
+#epdf-align-guides.visible { display: block; }
+#epdf-align-guides .epdf-guide-v,
+#epdf-align-guides .epdf-guide-h {
+  position: absolute;
+  background: transparent;
+  display: none;
+}
+#epdf-align-guides .epdf-guide-v {
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1.5px dashed #ec4899;
+}
+#epdf-align-guides .epdf-guide-h {
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 1.5px dashed #ec4899;
+}
+#epdf-align-guides.show-v .epdf-guide-v { display: block; }
+#epdf-align-guides.show-h .epdf-guide-h { display: block; }
 :root {
   --page-pad-x: 56px;
   --page-pad-y: 72px;
@@ -142,12 +186,12 @@ body.epdf-resizing-table-row * { cursor: row-resize !important; }
   position: absolute;
   top: -1px;
   left: -1px;
-  width: 34px;
-  height: 34px;
+  width: 28px;
+  height: 28px;
   padding: 0;
   border: 0;
   background: #2563eb;
-  border-radius: 6px 0 6px 0;
+  border-radius: 4px 0 6px 0;
   cursor: grab !important;
   display: flex;
   align-items: center;
@@ -155,9 +199,11 @@ body.epdf-resizing-table-row * { cursor: row-resize !important; }
   color: #fff;
   pointer-events: auto;
   user-select: none;
-  box-shadow: 0 3px 10px rgba(37,99,235,.45);
+  box-shadow: 0 2px 8px rgba(37,99,235,.4);
   z-index: 2;
 }
+#epdf-iframe-sel .epdf-sel-move:active { cursor: grabbing !important; }
+#epdf-iframe-sel .epdf-sel-move svg { fill: currentColor; }
 #epdf-iframe-sel .epdf-sel-resize {
   position: absolute;
   top: 50%;
@@ -439,7 +485,6 @@ let dropIndicatorEl = null;
 let selectedPage = null;
 let selectedCol = null;
 let snapshotDebounceTimer = null;
-let skipNextSnapshot = false;
 
 if (!jobId) {
   location.href = "/";
@@ -506,7 +551,8 @@ function markColSelected(col) {
 }
 
 function markSelected(el) {
-  cleanupDragUi();
+  // Never wipe an in-progress drag — startFreeImageDrag sets pointerDrag then refreshes selection
+  if (!pointerDrag) cleanupDragUi();
   clearColSelection();
   doc().querySelectorAll(".epdf-selected").forEach((n) => n.classList.remove("epdf-selected"));
   doc().querySelectorAll(".epdf-page-selected").forEach((n) => n.classList.remove("epdf-page-selected"));
@@ -724,9 +770,17 @@ function iframeElementsAt(clientX, clientY) {
   if (x < 0 || y < 0 || x > rect.width || y > rect.height) return { x, y, hits: [] };
   const d = doc();
   if (!d) return { x, y, hits: [] };
-  const hits = d.elementsFromPoint
+  const raw = d.elementsFromPoint
     ? d.elementsFromPoint(x, y).filter((n) => n.nodeType === 1)
     : [d.elementFromPoint(x, y)].filter(Boolean);
+  // Ignore editor chrome + the block being dragged so drop targeting sees real content
+  const dragging = pointerDrag?.block;
+  const hits = raw.filter((n) => {
+    if (n.closest?.("[data-epdf-chrome]")) return false;
+    if (n.id === "epdf-iframe-sel" || n.id === "epdf-iframe-drop" || n.id === "epdf-align-guides") return false;
+    if (dragging && (n === dragging || dragging.contains(n) || n.contains?.(dragging))) return false;
+    return true;
+  });
   return { x, y, hits };
 }
 
@@ -923,11 +977,10 @@ function ensureDropIndicator() {
 
 function showDragGhost(block, e) {
   const ghost = ensureDragGhost();
-  const rect = block.getBoundingClientRect();
-  const frameRect = frame.getBoundingClientRect();
-  const label = (block.textContent || block.tagName || "Block").replace(/\s+/g, " ").trim().slice(0, 72);
-  ghost.textContent = label || "Moving block…";
-  ghost.style.width = `${Math.min(Math.max(rect.width, 120), 320)}px`;
+  const kind = blockDropLabel(block);
+  ghost.innerHTML = `<span class="epdf-ghost-ico" aria-hidden="true">¶</span><span class="epdf-ghost-label"></span>`;
+  ghost.querySelector(".epdf-ghost-label").textContent = kind;
+  ghost.style.width = "auto";
   ghost.style.left = `${e.clientX + 14}px`;
   ghost.style.top = `${e.clientY + 14}px`;
   ghost.classList.add("visible");
@@ -935,6 +988,16 @@ function showDragGhost(block, e) {
 
 function hideDragGhost() {
   dragGhostEl?.classList.remove("visible");
+}
+
+function blockDropLabel(block) {
+  if (!block) return "Block";
+  if (isImageBlock(block)) return "Image";
+  if (block.matches?.("table, .epdf-table")) return "Table";
+  if (block.matches?.("h1, h2, h3, h4, h5, h6") || block.classList?.contains("epdf-col-heading")) return "Heading";
+  if (block.matches?.("ul, ol")) return "List";
+  if (block.matches?.("blockquote")) return "Quote";
+  return "Paragraph";
 }
 
 function isImageBlock(block) {
@@ -954,11 +1017,17 @@ function blockSpansFullWidth(el) {
 function cleanupDragUi() {
   hideDragGhost();
   hideDropIndicator();
+  hideAlignGuides();
+  hideIframeDropLine();
+  releaseDragPlaceholder();
   document.body.classList.remove("epdf-dragging-page");
   setOverlayDuringDrag(false);
   clearDropMarks();
   document.querySelectorAll(".page-thumb.drop-on").forEach((t) => t.classList.remove("drop-on"));
-  if (pointerDrag?.block) pointerDrag.block.classList.remove("epdf-dragging");
+  if (pointerDrag?.block) {
+    pointerDrag.block.classList.remove("epdf-dragging");
+    pointerDrag.block.style.opacity = "";
+  }
   pointerDrag = null;
   dragEl = null;
   if (dragRaf) {
@@ -968,30 +1037,350 @@ function cleanupDragUi() {
   dragLatestEvent = null;
 }
 
+function releaseDragPlaceholder(opts = {}) {
+  const ph = pointerDrag?.placeholder;
+  if (!ph) return;
+  if (opts.restore && pointerDrag?.block && ph.parentNode) {
+    ph.parentNode.insertBefore(pointerDrag.block, ph);
+  }
+  ph.remove();
+  if (pointerDrag) pointerDrag.placeholder = null;
+}
+
+/** Lift flow block out of layout so it doesn't leave a “stuck” copy; keep a height spacer. */
+function liftBlockForDrag(block) {
+  if (!block?.parentNode || pointerDrag?.placeholder) return;
+  const d = doc();
+  if (!d) return;
+  const rect = block.getBoundingClientRect();
+  const ph = d.createElement("div");
+  ph.className = "epdf-drag-placeholder";
+  ph.setAttribute("data-epdf-chrome", "1");
+  ph.style.height = `${Math.max(8, Math.round(rect.height))}px`;
+  ph.style.margin = "0 0 14px";
+  ph.style.borderRadius = "4px";
+  ph.style.background = "rgba(37, 99, 235, 0.08)";
+  ph.style.border = "1px dashed rgba(37, 99, 235, 0.35)";
+  ph.style.boxSizing = "border-box";
+  block.parentNode.insertBefore(ph, block);
+  // Keep in DOM for drop, but out of visual flow — ghost represents it
+  block.style.display = "none";
+  pointerDrag.placeholder = ph;
+  pointerDrag.lifted = true;
+}
+
+function restoreLiftedBlock(block) {
+  if (!block) return;
+  block.style.display = "";
+  block.style.opacity = "";
+  block.classList.remove("epdf-dragging");
+}
+
 function hideDropIndicator() {
   dropIndicatorEl?.classList.remove("visible");
+}
+
+/** Where a dragged flow-block will land (Designrr-style slot). */
+function resolveDropSlot(e, block) {
+  const pt = iframePointFromEvent(e);
+  if (!pt?.el || !block) return null;
+  const page = pt.el.closest?.(".epdf-page");
+  if (!page) return null;
+
+  let target = movableBlock(pt.el.closest?.(BLOCK_SEL));
+  if (
+    target &&
+    (target === block || target.contains?.(block) || block.contains?.(target) || target.classList?.contains("epdf-free-pos"))
+  ) {
+    target = null;
+  }
+
+  if (target) {
+    const rect = target.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    return { type: "near", target, after, page };
+  }
+
+  const col = pt.el.closest?.(".epdf-col");
+  if (col && page.contains(col)) {
+    const kids = columnChildBlocks(col).filter((k) => k !== block && !k.classList?.contains("epdf-free-pos"));
+    let before = null;
+    for (const kid of kids) {
+      const r = kid.getBoundingClientRect();
+      if (e.clientY < r.top + r.height / 2) {
+        before = kid;
+        break;
+      }
+    }
+    return { type: "column", col, before, page };
+  }
+
+  const kids = contentBlocks(page).filter((k) => k !== block);
+  let before = null;
+  for (const kid of kids) {
+    const r = kid.getBoundingClientRect();
+    if (e.clientY < r.top + r.height / 2) {
+      before = kid;
+      break;
+    }
+  }
+  return { type: "page", page, before };
+}
+
+function applyDropSlot(block, slot) {
+  if (!block || !slot) return false;
+  if (slot.type === "near") {
+    const r = slot.target.getBoundingClientRect();
+    return placeBlockNear(block, slot.target, slot.after ? r.bottom - 1 : r.top + 1);
+  }
+  if (slot.type === "column") {
+    if (slot.before) slot.col.insertBefore(block, slot.before);
+    else slot.col.appendChild(block);
+    return true;
+  }
+  if (slot.type === "page") {
+    placeBlock(block, slot.page, slot.before || slot.page.querySelector(".epdf-page-footer"));
+    return true;
+  }
+  return false;
+}
+
+function pageLocalRect(el, page) {
+  if (!el || !page) return { left: 0, top: 0, width: 0, height: 0 };
+  const er = el.getBoundingClientRect();
+  const pr = page.getBoundingClientRect();
+  return {
+    left: er.left - pr.left + page.scrollLeft,
+    top: er.top - pr.top + page.scrollTop,
+    width: er.width,
+    height: er.height,
+  };
+}
+
+function dropSlotLineGeometry(slot, block, host) {
+  if (!slot?.page || !host) return null;
+  const page = slot.page;
+
+  if (slot.type === "near") {
+    const rHost = blockRectInHost(slot.target, host);
+    const rPage = pageLocalRect(slot.target, page);
+    const col = slot.target.closest?.(".epdf-col");
+    const spanHost = col ? blockRectInHost(col, host) : rHost;
+    const spanPage = col ? pageLocalRect(col, page) : rPage;
+    return {
+      left: spanHost.left,
+      width: spanHost.width,
+      top: slot.after ? rHost.top + rHost.height - 2 : rHost.top - 2,
+      page,
+      iframeLeft: spanPage.left,
+      iframeWidth: spanPage.width,
+      iframeTop: slot.after ? rPage.top + rPage.height - 2 : rPage.top - 2,
+    };
+  }
+
+  if (slot.type === "column") {
+    const spanHost = blockRectInHost(slot.col, host);
+    const spanPage = pageLocalRect(slot.col, page);
+    let top = spanHost.top + 8;
+    let iframeTop = spanPage.top + 8;
+    if (slot.before) {
+      const rHost = blockRectInHost(slot.before, host);
+      const rPage = pageLocalRect(slot.before, page);
+      top = rHost.top - 2;
+      iframeTop = rPage.top - 2;
+    } else {
+      const kids = columnChildBlocks(slot.col).filter((k) => k !== block);
+      if (kids.length) {
+        const last = kids[kids.length - 1];
+        const rHost = blockRectInHost(last, host);
+        const rPage = pageLocalRect(last, page);
+        top = rHost.top + rHost.height - 2;
+        iframeTop = rPage.top + rPage.height - 2;
+      }
+    }
+    return {
+      left: spanHost.left,
+      width: spanHost.width,
+      top,
+      page,
+      iframeLeft: spanPage.left,
+      iframeWidth: spanPage.width,
+      iframeTop,
+    };
+  }
+
+  if (slot.type === "page") {
+    const pageHost = blockRectInHost(page, host);
+    let top = pageHost.top + 24;
+    let iframeTop = 24;
+    if (slot.before) {
+      const rHost = blockRectInHost(slot.before, host);
+      const rPage = pageLocalRect(slot.before, page);
+      top = rHost.top - 2;
+      iframeTop = rPage.top - 2;
+    } else {
+      const kids = contentBlocks(page).filter((k) => k !== block);
+      if (kids.length) {
+        const last = kids[kids.length - 1];
+        const rHost = blockRectInHost(last, host);
+        const rPage = pageLocalRect(last, page);
+        top = rHost.top + rHost.height - 2;
+        iframeTop = rPage.top + rPage.height - 2;
+      }
+    }
+    return {
+      left: pageHost.left + 12,
+      width: Math.max(40, pageHost.width - 24),
+      top,
+      page,
+      iframeLeft: 12,
+      iframeWidth: Math.max(40, page.clientWidth - 24),
+      iframeTop,
+    };
+  }
+  return null;
 }
 
 function updateDropIndicator(e, block) {
   const indicator = ensureDropIndicator();
   const host = overlayHost();
-  const pt = iframePointFromEvent(e);
-  if (!host || !pt?.el) {
+  const slot = resolveDropSlot(e, block);
+  const geo = dropSlotLineGeometry(slot, block, host);
+  if (!host || !geo) {
     indicator.classList.remove("visible");
+    hideIframeDropLine();
     return;
   }
-  const target = movableBlock(pt.el.closest?.(BLOCK_SEL));
-  if (target && target !== block && !target.contains(block)) {
-    const iframeRect = target.getBoundingClientRect();
-    const after = e.clientY > iframeRect.top + iframeRect.height / 2;
-    const rect = blockRectInHost(target, host);
-    indicator.style.left = `${rect.left}px`;
-    indicator.style.width = `${rect.width}px`;
-    indicator.style.top = `${after ? rect.top + rect.height - 2 : rect.top - 2}px`;
-    indicator.classList.add("visible");
-  } else {
-    indicator.classList.remove("visible");
+  indicator.style.left = `${geo.left}px`;
+  indicator.style.width = `${geo.width}px`;
+  indicator.style.top = `${geo.top}px`;
+  indicator.classList.add("visible");
+  showIframeDropLine(geo);
+}
+
+function ensureIframeDropLine(page) {
+  const d = doc();
+  if (!d || !page) return null;
+  let el = d.getElementById("epdf-iframe-drop");
+  if (!el) {
+    el = d.createElement("div");
+    el.id = "epdf-iframe-drop";
+    el.setAttribute("data-epdf-chrome", "1");
+    page.appendChild(el);
+  } else if (el.parentElement !== page) {
+    page.appendChild(el);
   }
+  return el;
+}
+
+function showIframeDropLine(geo) {
+  if (!geo?.page) return;
+  const el = ensureIframeDropLine(geo.page);
+  if (!el) return;
+  // Prefer geometry from live target rects inside the page
+  el.style.left = `${Math.max(0, geo.iframeLeft)}px`;
+  el.style.width = `${Math.max(24, geo.iframeWidth)}px`;
+  el.style.top = `${Math.max(0, geo.iframeTop)}px`;
+  el.classList.add("visible");
+}
+
+function hideIframeDropLine() {
+  doc()?.getElementById("epdf-iframe-drop")?.classList.remove("visible");
+}
+
+function ensureAlignGuides(page) {
+  const d = doc();
+  if (!d || !page) return null;
+  let box = d.getElementById("epdf-align-guides");
+  if (!box) {
+    box = d.createElement("div");
+    box.id = "epdf-align-guides";
+    box.setAttribute("data-epdf-chrome", "1");
+    box.innerHTML = `<div class="epdf-guide-v"></div><div class="epdf-guide-h"></div>`;
+    page.appendChild(box);
+  } else if (box.parentElement !== page) {
+    page.appendChild(box);
+  }
+  return box;
+}
+
+function hideAlignGuides() {
+  const box = doc()?.getElementById("epdf-align-guides");
+  if (!box) return;
+  box.classList.remove("visible", "show-v", "show-h");
+}
+
+function snapFreeImagePosition(block, page, left, top) {
+  const SNAP = 10;
+  const bw = block.offsetWidth || 0;
+  const bh = block.offsetHeight || 0;
+  const pw = page.clientWidth || 0;
+  const ph = Math.max(page.scrollHeight, page.clientHeight);
+  const xStops = [0, Math.max(0, pw - bw), Math.max(0, (pw - bw) / 2)];
+  const yStops = [0, Math.max(0, (ph - bh) / 2)];
+  const pageRect = page.getBoundingClientRect();
+
+  page.querySelectorAll(".epdf-col").forEach((col) => {
+    const cr = col.getBoundingClientRect();
+    const cl = cr.left - pageRect.left + page.scrollLeft;
+    const cw = cr.width;
+    xStops.push(cl, cl + cw - bw, cl + (cw - bw) / 2);
+  });
+
+  page.querySelectorAll(".epdf-figure.epdf-free-pos, .epdf-page > p, .epdf-col > p, .epdf-col > h1, .epdf-col > h2").forEach((el) => {
+    if (el === block) return;
+    const er = el.getBoundingClientRect();
+    const elLeft = er.left - pageRect.left + page.scrollLeft;
+    const elTop = er.top - pageRect.top + page.scrollTop;
+    xStops.push(elLeft, elLeft + er.width - bw, elLeft + (er.width - bw) / 2);
+    yStops.push(elTop, elTop + er.height - bh, elTop + (er.height - bh) / 2);
+  });
+
+  let bestL = left;
+  let bestDx = SNAP + 1;
+  let guideX = null;
+  for (const x of xStops) {
+    if (!Number.isFinite(x)) continue;
+    const d = Math.abs(left - x);
+    if (d < bestDx) {
+      bestDx = d;
+      bestL = x;
+      guideX = x + bw / 2;
+    }
+  }
+
+  let bestT = top;
+  let bestDy = SNAP + 1;
+  let guideY = null;
+  for (const y of yStops) {
+    if (!Number.isFinite(y)) continue;
+    const d = Math.abs(top - y);
+    if (d < bestDy) {
+      bestDy = d;
+      bestT = y;
+      guideY = y + bh / 2;
+    }
+  }
+
+  return {
+    left: bestDx <= SNAP ? bestL : left,
+    top: bestDy <= SNAP ? bestT : top,
+    guideX: bestDx <= SNAP ? guideX : null,
+    guideY: bestDy <= SNAP ? guideY : null,
+  };
+}
+
+function showAlignGuides(page, guideX, guideY) {
+  const box = ensureAlignGuides(page);
+  if (!box) return;
+  const v = box.querySelector(".epdf-guide-v");
+  const h = box.querySelector(".epdf-guide-h");
+  box.classList.toggle("show-v", guideX != null);
+  box.classList.toggle("show-h", guideY != null);
+  box.classList.add("visible");
+  if (v && guideX != null) v.style.left = `${guideX}px`;
+  if (h && guideY != null) h.style.top = `${guideY}px`;
+  if (guideX == null && guideY == null) box.classList.remove("visible");
 }
 
 function mountPageNavThumb(slot, page) {
@@ -1027,17 +1416,18 @@ function pageIndexOf(el) {
 function placeBlockNear(block, target, clientY) {
   if (!block || !target || block === target || block.contains(target) || target.contains(block)) return false;
   const page = target.closest(".epdf-page");
-  if (!page || !page.contains(block)) return false;
+  if (!page) return false;
   const rect = target.getBoundingClientRect();
   const after = clientY > rect.top + rect.height / 2;
   const container = target.parentElement;
+  if (!container) return false;
   if (after) {
     let sib = target.nextElementSibling;
     while (sib && (sib.classList.contains("epdf-handle") || sib.classList.contains("epdf-page-footer"))) {
       sib = sib.nextElementSibling;
     }
     if (sib && sib !== block) container.insertBefore(block, sib);
-    else if (container?.classList?.contains("epdf-col")) container.appendChild(block);
+    else if (container.classList?.contains("epdf-col")) container.appendChild(block);
     else page.insertBefore(block, page.querySelector(".epdf-page-footer"));
   } else {
     container.insertBefore(block, target);
@@ -1053,21 +1443,8 @@ function finishBlockDrop(block, e) {
     refreshPageNavThumbs([srcIdx, +thumb.dataset.i]);
     return true;
   }
-  const pt = iframeHitTest(e.clientX, e.clientY);
-  if (!pt?.el) return false;
-  const target = movableBlock(pt.el.closest?.(BLOCK_SEL));
-  const page = pt.el.closest?.(".epdf-page");
-  if (target && target !== block) {
-    if (target.closest(".epdf-page") === block.closest(".epdf-page")) {
-      placeBlockNear(block, target, e.clientY);
-    } else {
-      placeBlock(block, target.closest(".epdf-page"), target);
-    }
-  } else if (page) {
-    placeBlock(block, page, contentBlocks(page)[0] || page.querySelector(".epdf-page-footer"));
-  } else {
-    return false;
-  }
+  const slot = resolveDropSlot(e, block);
+  if (!slot || !applyDropSlot(block, slot)) return false;
   const destIdx = pageIndexOf(block);
   markSelected(block);
   snapshot();
@@ -1086,14 +1463,11 @@ function highlightPageThumb(e) {
 
 function updateIframeDropMark(e, block) {
   clearDropMarks();
-  const pt = iframePointFromEvent(e);
-  if (!pt?.el) return;
-  const target = movableBlock(pt.el.closest?.(BLOCK_SEL));
-  if (target && target !== block && !target.contains(block)) {
-    target.classList.add("epdf-drop-line");
-  } else {
-    const page = pt.el.closest?.(".epdf-page");
-    if (page) page.classList.add("epdf-drop-page");
+  const slot = resolveDropSlot(e, block);
+  if (!slot) return;
+  // Blue insertion line is drawn by updateDropIndicator / #epdf-iframe-drop
+  if (slot.type === "page" && !slot.before && !contentBlocks(slot.page).filter((k) => k !== block).length) {
+    slot.page.classList.add("epdf-drop-page");
   }
 }
 
@@ -1125,7 +1499,7 @@ function enableFreeImagePosition(block) {
 }
 
 function startFreeImageDrag(e, block) {
-  const fig = enableFreeImagePosition(block);
+  const fig = imageFigure(block) || block;
   const page = fig?.closest?.(".epdf-page");
   if (!fig || !page) return false;
   const pageRect = page.getBoundingClientRect();
@@ -1141,13 +1515,25 @@ function startFreeImageDrag(e, block) {
     moved: false,
     pageLeft: pageRect.left,
     pageTop: pageRect.top,
+    wasFree: fig.classList.contains("epdf-free-pos"),
+    prevParent: fig.parentNode,
+    prevNext: fig.nextSibling,
+    originLeft: fig.style.left,
+    originTop: fig.style.top,
   };
-  markSelected(fig.querySelector("img") || fig);
   return true;
 }
 
 function onFreeImageDragFrame(e) {
   if (!pointerDrag?.free || !pointerDrag.block) return;
+  // Promote to free-pos only after the drag actually starts (not on mere click)
+  if (!pointerDrag.block.classList.contains("epdf-free-pos")) {
+    enableFreeImagePosition(pointerDrag.block);
+    const rect = pointerDrag.block.getBoundingClientRect();
+    pointerDrag.offsetX = e.clientX - rect.left;
+    pointerDrag.offsetY = e.clientY - rect.top;
+    markSelected(pointerDrag.block.querySelector?.("img") || pointerDrag.block);
+  }
   const { block, page, offsetX, offsetY } = pointerDrag;
   const pageRect = page.getBoundingClientRect();
   const maxL = Math.max(0, page.clientWidth - block.offsetWidth);
@@ -1156,8 +1542,12 @@ function onFreeImageDragFrame(e) {
   let top = e.clientY - pageRect.top - offsetY + page.scrollTop;
   left = Math.max(0, Math.min(maxL, left));
   top = Math.max(0, Math.min(maxT, top));
+  const snapped = snapFreeImagePosition(block, page, left, top);
+  left = Math.max(0, Math.min(maxL, snapped.left));
+  top = Math.max(0, Math.min(maxT, snapped.top));
   block.style.left = `${left}px`;
   block.style.top = `${top}px`;
+  showAlignGuides(page, snapped.guideX, snapped.guideY);
   positionSelectionOverlay();
 }
 
@@ -1168,8 +1558,15 @@ function startPointerDrag(e) {
   const block = selectionBlock();
   if (!block) return;
 
+  let ended = false;
   const endDrag = (ev) => {
-    unbind();
+    if (ended) return;
+    ended = true;
+    try {
+      unbind();
+    } catch {
+      /* ignore */
+    }
     onPointerDragEnd(ev);
   };
   let unbind = () => {};
@@ -1179,7 +1576,7 @@ function startPointerDrag(e) {
     if (!startFreeImageDrag(e, block)) return;
     const onMove = (ev) => onPointerDragMove(ev);
     unbind = bindDragTracking(onMove, endDrag);
-    pointerDrag.unbind = unbind;
+    if (pointerDrag) pointerDrag.unbind = unbind;
     setFramePointerPassThrough(true);
     return;
   }
@@ -1192,13 +1589,26 @@ function startPointerDrag(e) {
 
 function onPointerDragEnd(e) {
   if (!pointerDrag) {
-    cleanupDragUi();
+    hideDragGhost();
+    hideDropIndicator();
+    hideAlignGuides();
+    hideIframeDropLine();
+    setFramePointerPassThrough(false);
     return;
   }
   const block = pointerDrag.block;
   const moved = pointerDrag.moved;
   const free = pointerDrag.free;
+  const lifted = !!pointerDrag.lifted;
+  const ph = pointerDrag.placeholder;
+  const anchorParent = ph?.parentNode || null;
+  const anchorNext = ph?.nextSibling || null;
+  const wasFree = pointerDrag.wasFree;
+  const prevParent = pointerDrag.prevParent;
+  const prevNext = pointerDrag.prevNext;
   const unbind = pointerDrag.unbind;
+  const dropEvent = e || dragLatestEvent;
+
   if (unbind) {
     try {
       unbind();
@@ -1206,20 +1616,76 @@ function onPointerDragEnd(e) {
       /* ignore */
     }
   }
-  cleanupDragUi();
+
+  // Clear drag chrome first; drop pointerDrag so markSelected can run normally
+  hideDragGhost();
+  hideDropIndicator();
+  hideAlignGuides();
+  hideIframeDropLine();
+  clearDropMarks();
+  document.querySelectorAll(".page-thumb.drop-on").forEach((t) => t.classList.remove("drop-on"));
+  document.body.classList.remove("epdf-dragging-page");
+  setOverlayDuringDrag(false);
+  if (block) {
+    block.classList.remove("epdf-dragging");
+    block.style.opacity = "";
+  }
+  if (ph) ph.remove();
+  pointerDrag = null;
+  dragEl = null;
+  if (dragRaf) {
+    cancelAnimationFrame(dragRaf);
+    dragRaf = null;
+  }
+  dragLatestEvent = null;
   setFramePointerPassThrough(false);
+
   if (free) {
+    if (!moved && !wasFree && block?.classList?.contains("epdf-free-pos") && prevParent) {
+      // Click without drag — put image back in flow
+      block.classList.remove("epdf-free-pos");
+      block.style.position = "";
+      block.style.left = "";
+      block.style.top = "";
+      block.style.zIndex = "";
+      block.style.margin = "";
+      try {
+        prevParent.insertBefore(block, prevNext);
+      } catch {
+        prevParent.appendChild(block);
+      }
+    }
     if (moved) {
       markSelected(block.querySelector?.("img") || block);
       snapshot();
       resizeFrame();
       refreshPageNavThumb(pageIndexOf(block));
+    } else {
+      positionSelectionOverlay();
     }
-    positionSelectionOverlay();
     return;
   }
-  if (moved && e) finishBlockDrop(block, e);
-  else positionSelectionOverlay();
+
+  restoreLiftedBlock(block);
+
+  let placed = false;
+  if (moved && dropEvent) {
+    placed = finishBlockDrop(block, dropEvent);
+  }
+
+  if (!placed && lifted && anchorParent) {
+    // Put heading/block back where the spacer was
+    try {
+      anchorParent.insertBefore(block, anchorNext);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (!placed) {
+    markSelected(block);
+    positionSelectionOverlay();
+  }
 }
 
 function onPointerDragMove(e) {
@@ -1242,7 +1708,10 @@ function onPointerDragMoveFrame(e) {
     document.body.classList.add("epdf-dragging-page");
     setFramePointerPassThrough(true);
     setOverlayDuringDrag(true);
-    if (!pointerDrag.free) showDragGhost(pointerDrag.block, e);
+    if (!pointerDrag.free) {
+      liftBlockForDrag(pointerDrag.block);
+      showDragGhost(pointerDrag.block, e);
+    }
   }
   if (pointerDrag.free) {
     onFreeImageDragFrame(e);
@@ -1929,29 +2398,30 @@ function syncStyleInputs(el) {
   }
 }
 
-function snapshot() {
-  if (skipNextSnapshot) {
-    skipNextSnapshot = false;
-    return;
-  }
+function snapshot(opts = {}) {
+  if (undoRestoring && !opts.force) return;
   const html = serialize();
-  if (undoStack.length && undoStack[histIndex] === html) return;
+  if (!html || html.length < 20) return;
+  if (undoStack.length && histIndex >= 0 && undoStack[histIndex] === html) return;
+  // New edit while mid-undo → drop redo branch
   undoStack = undoStack.slice(0, histIndex + 1);
   undoStack.push(html);
   if (undoStack.length > 80) undoStack.shift();
   histIndex = undoStack.length - 1;
-  scheduleSave();
+  if (!opts.quiet) scheduleSave();
 }
 
 function scheduleSnapshot() {
+  if (undoRestoring) return;
   clearTimeout(snapshotDebounceTimer);
   snapshotDebounceTimer = setTimeout(() => {
     snapshotDebounceTimer = null;
     snapshot();
-  }, 450);
+  }, 400);
 }
 
 function flushPendingSnapshot() {
+  if (undoRestoring) return;
   if (snapshotDebounceTimer) {
     clearTimeout(snapshotDebounceTimer);
     snapshotDebounceTimer = null;
@@ -1959,18 +2429,15 @@ function flushPendingSnapshot() {
   }
 }
 
-function ensureCurrentInHistory() {
-  const html = serialize();
-  if (!undoStack.length) {
-    snapshot();
-    return;
+/** After iframe reload, heal stack tip so it matches live DOM (bindFrame mutates widths etc.). */
+function syncUndoTipWithLiveDom() {
+  if (histIndex < 0 || histIndex >= undoStack.length) return;
+  try {
+    const html = serialize();
+    if (html && html.length > 20) undoStack[histIndex] = html;
+  } catch {
+    /* ignore */
   }
-  if (undoStack[histIndex] === html) return;
-  undoStack = undoStack.slice(0, histIndex + 1);
-  undoStack.push(html);
-  if (undoStack.length > 80) undoStack.shift();
-  histIndex = undoStack.length - 1;
-  scheduleSave();
 }
 
 function withBase(html) {
@@ -1993,7 +2460,10 @@ function restore(html) {
   pendingRestoreView = getViewAnchor();
   selected = null;
   selectedPage = null;
-  skipNextSnapshot = true;
+  selectedCol = null;
+  undoRestoring = true;
+  clearTimeout(snapshotDebounceTimer);
+  snapshotDebounceTimer = null;
   frame.srcdoc = withBase(html);
 }
 
@@ -2028,58 +2498,29 @@ function applyPendingRestoreView() {
   requestAnimationFrame(() => requestAnimationFrame(go));
 }
 
-function tryNativeUndo() {
-  const d = doc();
-  if (!d) return false;
-  try {
-    return d.execCommand("undo");
-  } catch {
-    return false;
-  }
-}
-
-function tryNativeRedo() {
-  const d = doc();
-  if (!d) return false;
-  try {
-    return d.execCommand("redo");
-  } catch {
-    return false;
-  }
-}
-
 function doUndo() {
+  if (undoRestoring) return;
   flushPendingSnapshot();
-  ensureCurrentInHistory();
-  if (histIndex > 0) {
-    histIndex -= 1;
-    restore(undoStack[histIndex]);
-    setSaveUi("Undone");
+  if (histIndex <= 0) {
+    setSaveUi("Nothing to undo");
     return;
   }
-  if (tryNativeUndo()) {
-    scheduleSnapshot();
-    setSaveUi("Undone");
-    return;
-  }
-  setSaveUi("Nothing to undo");
+  histIndex -= 1;
+  restore(undoStack[histIndex]);
+  setSaveUi("Undone");
 }
 
 function doRedo() {
+  if (undoRestoring) return;
+  // Pending typing is a new edit — flush truncates redo (correct)
   flushPendingSnapshot();
-  ensureCurrentInHistory();
-  if (histIndex < undoStack.length - 1) {
-    histIndex += 1;
-    restore(undoStack[histIndex]);
-    setSaveUi("Redone");
+  if (histIndex >= undoStack.length - 1) {
+    setSaveUi("Nothing to redo");
     return;
   }
-  if (tryNativeRedo()) {
-    scheduleSnapshot();
-    setSaveUi("Redone");
-    return;
-  }
-  setSaveUi("Nothing to redo");
+  histIndex += 1;
+  restore(undoStack[histIndex]);
+  setSaveUi("Redone");
 }
 
 function handleUndoRedoKey(e) {
@@ -2087,11 +2528,13 @@ function handleUndoRedoKey(e) {
   const key = e.key.toLowerCase();
   if (key === "z" && !e.shiftKey) {
     e.preventDefault();
+    e.stopPropagation();
     doUndo();
     return true;
   }
   if (key === "y" || (key === "z" && e.shiftKey)) {
     e.preventDefault();
+    e.stopPropagation();
     doRedo();
     return true;
   }
@@ -2232,7 +2675,10 @@ function blobToData(blob) {
 function bindFrame() {
   cleanupDragUi();
   const d = doc();
-  if (!d || !d.body) return;
+  if (!d || !d.body) {
+    if (undoRestoring) undoRestoring = false;
+    return;
+  }
   if (d.documentElement.getAttribute("data-epdf-bound") === "1") {
     tidyDocument();
     enableEditing();
@@ -2243,6 +2689,10 @@ function bindFrame() {
     resizeFrame();
     buildPageNav();
     applyPendingRestoreView();
+    if (undoRestoring) {
+      syncUndoTipWithLiveDom();
+      undoRestoring = false;
+    }
     positionSelectionOverlay();
     positionPageOverlay();
     positionColDivider();
@@ -2264,8 +2714,9 @@ function bindFrame() {
   d.body.addEventListener("click", onClick);
   d.body.addEventListener("dblclick", onDblClick);
   d.addEventListener("keydown", onEditorKey);
-  d.addEventListener("beforeinput", () => scheduleSnapshot());
+  // Typing: debounce snapshot AFTER edits only (beforeinput was capturing the wrong moment)
   d.addEventListener("input", () => {
+    if (undoRestoring) return;
     scheduleSave();
     scheduleSnapshot();
     requestAnimationFrame(() => positionSelectionOverlay());
@@ -2304,9 +2755,15 @@ function bindFrame() {
   buildPageNav();
   fillMovePageGrid();
   requestAnimationFrame(() => resizeFrame());
-  if (!undoStack.length) snapshot();
-  scheduleSave();
   applyPendingRestoreView();
+  if (undoRestoring) {
+    // bindFrame mutates DOM (widths, padding) — keep stack tip in sync so next Ctrl+Z works
+    syncUndoTipWithLiveDom();
+    undoRestoring = false;
+  } else if (!undoStack.length) {
+    snapshot({ quiet: true });
+  }
+  scheduleSave();
   positionPageOverlay();
   positionColDivider();
 }
@@ -2615,7 +3072,11 @@ function makeBlankPage(auto) {
 
 function columnChildBlocks(col) {
   return [...(col?.children || [])].filter(
-    (n) => n.tagName && !n.classList.contains("epdf-handle")
+    (n) =>
+      n.tagName &&
+      !n.classList.contains("epdf-handle") &&
+      !n.classList.contains("epdf-free-pos") &&
+      !n.hasAttribute?.("data-epdf-chrome")
   );
 }
 
@@ -2625,6 +3086,9 @@ function contentBlocks(page) {
   const blocks = [];
   for (const child of [...page.children]) {
     if (!child.tagName || child === footer || child.classList.contains("epdf-handle")) continue;
+    if (child.hasAttribute?.("data-epdf-chrome")) continue;
+    if (child.classList.contains("epdf-free-pos")) continue;
+    if (child.id === "epdf-iframe-sel" || child.id === "epdf-iframe-drop" || child.id === "epdf-align-guides") continue;
     if (child.classList.contains("epdf-layout")) {
       // Newspaper reading order: LEFT column fully, then RIGHT column
       const cols = [...child.querySelectorAll(":scope > .epdf-col")];
